@@ -1,0 +1,7 @@
+openai
+langgraph
+langchain-core
+psycopg2-binary
+pymongo
+pandas
+python-dotenv
