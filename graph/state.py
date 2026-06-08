@@ -19,9 +19,16 @@ class AppState(TypedDict, total=False):
 
     # --- worker outputs (each worker writes its slice) ---
     sql_result: dict[str, Any]   # the SQLResult, as a dict
+    data_result: dict[str, Any]  # the Data agent's result (cells, summary, notebook path)
 
     # --- final ---
     answer: str                  # the composed answer (the synthesizer will fill this)
+
+    # --- QA / verification ---
+    qa_ok: bool                  # did the last result pass verification?
+    qa_feedback: str             # specific problems found, fed back to the agent on retry
+    qa_retries: int              # how many regeneration attempts so far
+    qa_exhausted: bool           # ran out of retries; result accepted but flagged unverified
 
     # --- control / safety ---
     steps: int                   # circuit breaker: how many supervisor hops so far

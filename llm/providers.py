@@ -11,7 +11,7 @@ from .base import LLMProvider, LLMResponse, ToolCall
 class OpenAIProvider(LLMProvider):
     """Talks to the OpenAI API. The only file in the project that imports openai."""
 
-    def __init__(self, model: str = "gpt-4o-mini", api_key: str | None = None):
+    def __init__(self, model: str = "gpt-4o", api_key: str | None = None):
         from openai import OpenAI                 # imported lazily so Ollama users need not install it
         self._client = OpenAI(api_key=api_key)    # falls back to OPENAI_API_KEY env var
         self._model = model

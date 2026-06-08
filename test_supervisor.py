@@ -33,6 +33,8 @@ def run(request: str):
                 else:
                     print(f"   sql: {r.get('sql')}")
                     print(f"   rows: {r.get('rows')}")
+            if "answer" in update:
+                print(f"\n=== FINAL ANSWER ===\n{update['answer']}")
 
 
 if __name__ == "__main__":
