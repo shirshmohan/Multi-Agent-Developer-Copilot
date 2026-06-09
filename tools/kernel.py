@@ -11,8 +11,16 @@ WHY a real kernel instead of exec():
 This wraps jupyter_client — the same library the notebook UI uses underneath.
 """
 import queue
+import sys
+import asyncio
 from dataclasses import dataclass, field
 from jupyter_client import KernelManager
+
+# Windows fix: jupyter_client launches the kernel via asyncio subprocess, which needs
+# the Proactor event loop policy on Windows. Without this you get
+# "RuntimeError: no running event loop" / WinError 2 when starting a kernel.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
 @dataclass
@@ -24,18 +32,23 @@ class CellOutput:
     error: str = ""                        # traceback text, if the cell raised
     ok: bool = True                        # did it run without error?
 
-    def summary_for_model(self) -> str:
+    def summary_for_model(self, max_chars: int = 1500) -> str:
         """A compact TEXT view to feed back to the LLM. Images are noted, not inlined
-        (we don't send the raw base64 to the model — too big; we say a chart was made)."""
+        (we don't send the raw base64 to the model — too big; we say a chart was made).
+        Output is truncated: a giant df dump or long traceback re-sent every loop wastes
+        tokens and hits rate limits. The model needs the gist, not every byte."""
+        def clip(s: str) -> str:
+            s = s.strip()
+            return s if len(s) <= max_chars else s[:max_chars] + "\n...[truncated]"
         parts = []
         if self.stdout.strip():
-            parts.append(f"stdout:\n{self.stdout.strip()}")
+            parts.append(f"stdout:\n{clip(self.stdout)}")
         if self.result.strip():
-            parts.append(f"result:\n{self.result.strip()}")
+            parts.append(f"result:\n{clip(self.result)}")
         if self.images:
             parts.append(f"[{len(self.images)} chart(s) produced]")
         if self.error:
-            parts.append(f"ERROR:\n{self.error.strip()}")
+            parts.append(f"ERROR:\n{clip(self.error)}")
         return "\n".join(parts) if parts else "(no output)"
 
 

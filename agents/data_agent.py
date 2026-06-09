@@ -122,10 +122,14 @@ class DataResult:
 
 
 def run_data_agent(task: str, kernel: JupyterKernel | None = None,
-                   provider: str | None = None, prelude: str | None = None) -> DataResult:
+                   provider: str | None = None, prelude: str | None = None,
+                   require_training: bool | None = None) -> DataResult:
     """Run the iterative data-science loop for `task`.
     `kernel` lets a caller pass a pre-seeded kernel (e.g. with a df already loaded);
-    `prelude` is optional setup code run silently before the agent starts."""
+    `prelude` is optional setup code run silently before the agent starts.
+    `require_training`: if True, block 'finish' until a model is trained; if False,
+    allow finishing without training (e.g. an EDA-only phase); if None, auto-detect
+    from the task wording (the default standalone behavior)."""
     own_kernel = kernel is None
     k = kernel or JupyterKernel()
     llm = get_llm(provider)
@@ -158,8 +162,12 @@ def run_data_agent(task: str, kernel: JupyterKernel | None = None,
                 # VERIFY the agent actually did what the task implied before accepting "done".
                 # The agent will claim success it didn't achieve — don't take its word.
                 all_code = "\n".join(c.code for c in cells)
-                wants_model = any(w in task.lower() for w in
-                                  ("train", "model", "predict", "classif", "regress"))
+                # require_training: explicit override wins; else auto-detect from task.
+                if require_training is None:
+                    wants_model = any(w in task.lower() for w in
+                                      ("train", "model", "predict", "classif", "regress"))
+                else:
+                    wants_model = require_training
                 did_train = ".fit(" in all_code
                 if wants_model and not did_train and len(cells) < MAX_CELLS - 2:
                     # reject the premature finish, tell it exactly what's missing

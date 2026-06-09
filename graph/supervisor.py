@@ -14,6 +14,8 @@ from langgraph.graph import StateGraph, START, END
 from llm import get_llm
 from agents.sql_agent import run_sql_agent
 from agents.data_agent import run_data_agent
+from agents.ml_researcher import run_ml_researcher
+from tools.kernel import JupyterKernel
 from db_access.csv_export import export_query_to_csv
 from tools.notebook_writer import write_notebook
 from graph.state import AppState
@@ -123,12 +125,47 @@ def _handoff_prelude(state: AppState) -> tuple[str, dict] | tuple[None, None]:
     return prelude, meta
 
 
+def _extract_eda_summary(cells) -> str:
+    """Pull the EDA findings out of the executed cells — the stdout/result text from
+    df.info(), describe(), value_counts(), etc. This is the INFORMATION about the data
+    (not the rows) that the researcher reasons over."""
+    parts = []
+    for c in cells:
+        text = c.output.summary_for_model()      # no kwargs — version-agnostic
+        if text and text != "(no output)":
+            parts.append(text[:600])             # truncate per-cell here instead
+    return "\n".join(parts)[:4000]   # keep it compact for the researcher's prompt
+
+
+def _finalize_data_result(request, cells, summary, error, meta, prelude, theory=None):
+    """Write the notebook and build the data_result dict (shared by both flows)."""
+    import os
+    nb_path = write_notebook(request, cells, summary, "data_agent_session.ipynb")
+    phases = list(dict.fromkeys(c.phase for c in cells if c.phase))
+    all_code = "\n".join(c.code for c in cells)
+    trained = ".fit(" in all_code and "train_test_split" in all_code
+    csv_path = os.path.abspath(os.path.join("exports", "ml_dataset.csv")) if prelude else None
+
+    dr = {
+        "summary": summary, "n_cells": len(cells), "phases": phases,
+        "trained_model": trained, "dataset_rows": meta.get("rows") if meta else None,
+        "notebook": nb_path, "csv": csv_path, "had_data_handoff": prelude is not None,
+        "error": error, "research_theory": theory,
+    }
+    if error is not None:
+        dr["handoff_to_user"] = (
+            f"The agent got stuck and stopped. You can take over: the data is at "
+            f"{csv_path} and the notebook-so-far is at {os.path.abspath(nb_path)}. "
+            f"Open the notebook, fix the failing step, and continue manually.")
+    return dr
+
+
 def data_node(state: AppState) -> dict:
-    """Wrap the Data agent as a graph node. SQL result is handed off as a CSV the
-    agent reads into its kernel. Runs the loop, writes the notebook, stores results."""
+    """The Data agent as a graph node. For modeling tasks it runs a 3-phase flow on
+    ONE shared kernel: EDA -> ML researcher -> guided modeling. The kernel keeps df
+    and all EDA state alive across phases. For non-modeling tasks it runs once."""
     prelude, meta = _handoff_prelude(state)
 
-    # If the request needed DB data but export failed / no data, don't fabricate.
     sql = state.get("sql_result")
     if sql is not None and (sql.get("error") or not sql.get("sql")) and prelude is None:
         return {"data_result": {
@@ -137,56 +174,57 @@ def data_node(state: AppState) -> dict:
             "error": "no input data",
         }}
 
+    wants_model = any(w in state["request"].lower() for w in
+                      ("train", "model", "predict", "classif", "regress"))
+
+    # ---- SPLIT FLOW: EDA -> research -> guided modeling (only when modeling + data) ----
+    if wants_model and prelude is not None:
+        k = JupyterKernel()
+        try:
+            # PHASE 1 — EDA only (no training; finish allowed without a model)
+            eda_task = (
+                f"The data is ALREADY LOADED as a pandas DataFrame `df` "
+                f"({meta['rows']} rows, columns: {meta['columns']}). DO NOT invent data. "
+                f"Do EXPLORATORY DATA ANALYSIS ONLY: df.shape, df.info(), df.describe(), "
+                f"the target ('churn') distribution, and a chart. Do NOT train any model. "
+                f"When the EDA is done, finish.")
+            eda = run_data_agent(eda_task, kernel=k, prelude=prelude, require_training=False)
+
+            # extract the EDA findings and have the researcher produce guidance
+            eda_summary = _extract_eda_summary(eda.cells)
+            research = run_ml_researcher(state["request"], meta["columns"], eda_summary)
+            print("\n=== ML RESEARCHER GUIDANCE ===")
+            print(research.guidance)
+            print("\n=== THEORY (why these choices) ===")
+            print(research.theory, "\n")
+
+            # PHASE 2 — guided modeling on the SAME kernel (df + EDA vars still alive)
+            model_task = (
+                f"The DataFrame `df` is already loaded and you have already explored it. "
+                f"Now train models to answer: {state['request']}\n\n"
+                f"Use ONLY scikit-learn models (sklearn). Follow this expert guidance "
+                f"from the ML researcher:\n{research.guidance}\n\n"
+                f"Define X and y, split (stratify), train the recommended models, tune "
+                f"the best, and evaluate with the recommended metric. Report results.")
+            model = run_data_agent(model_task, kernel=k, require_training=True)
+
+            cells = eda.cells + model.cells
+            summary = model.summary
+            error = model.error
+            return {"data_result": _finalize_data_result(
+                state["request"], cells, summary, error, meta, prelude, research.theory)}
+        finally:
+            k.shutdown()
+
+    # ---- SIMPLE FLOW: single pass (non-modeling, or no data handoff) ----
     task = state["request"]
     if prelude is not None:
-        wants_model = any(w in state["request"].lower() for w in
-                          ("train", "model", "predict", "classif", "regress"))
-        extra = ""
-        if wants_model:
-            extra = (" Train and COMPARE multiple models (logistic regression, random "
-                     "forest, gradient boosting), then tune the best with "
-                     "RandomizedSearchCV, and report the final accuracy and "
-                     "classification report.")
-        task = (f"The data is ALREADY LOADED in the kernel as a pandas DataFrame `df`, "
-                f"read from a CSV ({meta['rows']} rows, columns: {meta['columns']}). "
-                f"DO NOT create, download, or invent data — use the existing `df`. "
-                f"Begin by understanding it: df.shape, df.info(), df.describe(), and the "
-                f"target distribution. Decide preprocessing from what you observe.{extra}\n\n"
-                f"Task: {state['request']}")
-
+        task = (f"The data is ALREADY LOADED in the kernel as a pandas DataFrame `df` "
+                f"({meta['rows']} rows, columns: {meta['columns']}). DO NOT invent data. "
+                f"Begin with df.shape, df.info(), df.describe().\n\nTask: {state['request']}")
     result = run_data_agent(task, prelude=prelude)
-    # write the notebook artifact
-    nb_path = write_notebook(state["request"], result.cells, result.summary,
-                             "data_agent_session.ipynb")
-    # inspect what the agent actually did, so the synthesizer can report it honestly
-    phases = list(dict.fromkeys(c.phase for c in result.cells if c.phase))
-    all_code = "\n".join(c.code for c in result.cells)
-    trained = ".fit(" in all_code and "train_test_split" in all_code
-    got_stuck = result.error is not None       # hit max cells / couldn't recover
-
-    import os
-    csv_path = os.path.abspath(os.path.join("exports", "ml_dataset.csv")) \
-        if prelude is not None else None
-
-    data_result = {
-        "summary": result.summary,
-        "n_cells": len(result.cells),
-        "phases": phases,
-        "trained_model": trained,
-        "dataset_rows": meta.get("rows") if meta else None,   # the TRUE full-dataset size
-        "notebook": nb_path,
-        "csv": csv_path,                       # so YOU can open/edit the data
-        "had_data_handoff": prelude is not None,
-        "error": result.error,
-    }
-    if got_stuck:
-        # PRAGMATIC COLLABORATION: agent couldn't finish. Hand control to the human
-        # with the artifacts, instead of silently failing or faking success.
-        data_result["handoff_to_user"] = (
-            f"The agent got stuck and stopped. You can take over: the data is at "
-            f"{csv_path} and the notebook-so-far is at {os.path.abspath(nb_path)}. "
-            f"Open the notebook, fix the failing step, and continue manually.")
-    return {"data_result": data_result}
+    return {"data_result": _finalize_data_result(
+        state["request"], result.cells, result.summary, result.error, meta, prelude)}
 
 
 def route_decision(state: AppState) -> str:
