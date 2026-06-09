@@ -4,6 +4,7 @@ Concrete backends. Each one's ONLY job: call its API and translate the result
 into the shared LLMResponse shape from base.py.
 """
 import json
+import time
 import uuid
 from .base import LLMProvider, LLMResponse, ToolCall
 
@@ -11,14 +12,26 @@ from .base import LLMProvider, LLMResponse, ToolCall
 class OpenAIProvider(LLMProvider):
     """Talks to the OpenAI API. The only file in the project that imports openai."""
 
-    def __init__(self, model: str = "gpt-4o", api_key: str | None = None):
+    def __init__(self, model: str = "gpt-4o-mini", api_key: str | None = None):
         from openai import OpenAI                 # imported lazily so Ollama users need not install it
         self._client = OpenAI(api_key=api_key)    # falls back to OPENAI_API_KEY env var
         self._model = model
 
     def generate(self, messages, tools=None):
-        resp = self._client.chat.completions.create(
-            model=self._model, messages=messages, tools=tools)
+        from openai import RateLimitError
+        # Retry on rate limits (TPM) instead of crashing the whole graph run.
+        # A long ML pipeline makes many calls; one 429 shouldn't kill everything.
+        for attempt in range(5):
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self._model, messages=messages, tools=tools)
+                break
+            except RateLimitError:
+                if attempt == 4:
+                    raise
+                wait = 5 * (attempt + 1)          # 5s, 10s, 15s, 20s backoff
+                print(f"   [rate limit hit — waiting {wait}s and retrying]")
+                time.sleep(wait)
         msg = resp.choices[0].message
 
         # --- normalize: OpenAI gives a structured tool_calls array ---

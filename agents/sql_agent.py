@@ -22,7 +22,12 @@ Rules:
 - SELECT queries only. Never modify data.
 - Use only the tables and columns in the schema below.
 - Use JOINs via the listed foreign keys when the answer spans tables.
-- Keep results reasonable; prefer aggregates over dumping every row.
+- The request may also mention analysis, EDA, charts, or model training. That is
+  NOT your job — IGNORE those parts. Your ONLY job is to fetch the relevant data.
+  If the task is to train a model on customer data, return the FULL per-customer
+  rows (all relevant columns), NOT an aggregate summary.
+- ALWAYS return your query by calling the emit_sql tool. Never reply with prose or
+  a markdown code block — only the tool call.
 
 SCHEMA:
 {schema}

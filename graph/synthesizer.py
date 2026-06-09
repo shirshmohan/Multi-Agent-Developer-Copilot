@@ -31,8 +31,14 @@ def _format_results(state: AppState) -> str:
         if sql.get("error"):
             parts.append(f"SQL agent error: {sql['error']}")
         else:
+            rows = sql.get("rows") or []
             parts.append(f"SQL query: {sql.get('sql')}")
-            parts.append(f"SQL rows: {sql.get('rows')}")
+            # This 'rows' is only a 100-row PREVIEW (the guard's LIMIT). The full dataset
+            # was exported to CSV — the real count is in data_result, not here.
+            parts.append(f"SQL query ran successfully (preview of {len(rows)} rows shown; "
+                         f"full result was exported for analysis — see dataset size below).")
+            if rows:
+                parts.append(f"Columns: {list(rows[0].keys())}")
             if state.get("qa_exhausted"):
                 parts.append("NOTE: this result did not pass verification — flag it as unverified.")
 
@@ -44,7 +50,9 @@ def _format_results(state: AppState) -> str:
             parts.append(f"Data agent summary (UNVERIFIED self-report): {data.get('summary')}")
             parts.append(f"Data agent ran {data.get('n_cells', 0)} notebook cells "
                          f"across phases: {', '.join(data.get('phases', [])) or 'n/a'}.")
-            # The FACT, derived from the actual code — trust this over the self-report.
+            if data.get("dataset_rows"):
+                parts.append(f"The analysis used the FULL dataset of {data['dataset_rows']} rows "
+                             f"(not the 100-row preview).")
             if data.get("trained_model"):
                 parts.append("VERIFIED: a model was actually trained (model.fit was called).")
             else:
@@ -53,6 +61,10 @@ def _format_results(state: AppState) -> str:
                              "model training did not complete.")
             if data.get("notebook"):
                 parts.append(f"Notebook saved to: {data['notebook']}")
+            if data.get("csv"):
+                parts.append(f"The dataset CSV is at: {data['csv']}")
+            if data.get("handoff_to_user"):
+                parts.append(f"IMPORTANT — TELL THE USER: {data['handoff_to_user']}")
     return "\n".join(parts) if parts else "No results were gathered."
 
 

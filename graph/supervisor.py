@@ -14,6 +14,7 @@ from langgraph.graph import StateGraph, START, END
 from llm import get_llm
 from agents.sql_agent import run_sql_agent
 from agents.data_agent import run_data_agent
+from db_access.csv_export import export_query_to_csv
 from tools.notebook_writer import write_notebook
 from graph.state import AppState
 from graph.qa import qa_node
@@ -100,58 +101,57 @@ def sql_node(state: AppState) -> dict:
     return {"sql_result": result.__dict__}             # store the SQLResult as a dict
 
 
-def _handoff_prelude(state: AppState) -> str | None:
-    """SQL -> Data handoff that respects 'never move the data through the LLM'.
-    Instead of serializing rows into the prelude, we pass the QUERY and let the
-    data agent's kernel load the data DIRECTLY from Postgres via read_sql.
-    The rows never touch any LLM context — only the query string does."""
+def _handoff_prelude(state: AppState) -> tuple[str, dict] | tuple[None, None]:
+    """SQL -> Data handoff via CSV. The SQL agent's query result is exported to a
+    full CSV file (no row cap), then the data agent's kernel reads that file.
+    Returns (prelude_code, csv_metadata). The rows live only in the file + kernel,
+    never in any LLM context."""
     sql = state.get("sql_result")
     if not sql or sql.get("error") or not sql.get("sql"):
-        return None
-    # The LIMIT was added by the guard to protect the LLM CONTEXT from huge results.
-    # But the kernel loads data directly (bypassing the LLM), so for training we want
-    # the FULL dataset. Strip a trailing "LIMIT n" for the kernel load only.
-    import re
-    query = re.sub(r"\s+limit\s+\d+\s*;?\s*$", "", sql["sql"], flags=re.IGNORECASE).strip()
-    query = query.replace("'", "''")   # escape single quotes for embedding
-    # The kernel connects to Postgres itself (as the limited agent_user role) and
-    # loads df. This is the database->kernel pipe; the data bypasses the LLM entirely.
-    return (
-        "import pandas as pd, psycopg2\n"
-        "_conn = psycopg2.connect(host='localhost', port=5433, dbname='telecom', "
-        "user='agent_user', password='agent_pw')\n"
-        f"df = pd.read_sql('{query}', _conn)\n"
-        "_conn.close()\n"
-        "print('Loaded df directly from Postgres:', df.shape)"
+        return None, None
+    try:
+        meta = export_query_to_csv(sql["sql"], name="ml_dataset")   # full result -> CSV
+    except Exception as e:
+        return None, {"error": f"CSV export failed: {e}"}
+
+    # prelude: read the CSV into the kernel. df.info()/describe() come next (the agent's job).
+    prelude = (
+        "import pandas as pd\n"
+        f"df = pd.read_csv(r'{meta['path']}')\n"
+        "print('Loaded df from CSV:', df.shape)"
     )
+    return prelude, meta
 
 
 def data_node(state: AppState) -> dict:
-    """Wrap the Data agent as a graph node. If SQL ran first, hand off its rows as `df`.
-    Runs the data-science loop, writes the notebook, stores the result."""
-    prelude = _handoff_prelude(state)
+    """Wrap the Data agent as a graph node. SQL result is handed off as a CSV the
+    agent reads into its kernel. Runs the loop, writes the notebook, stores results."""
+    prelude, meta = _handoff_prelude(state)
 
-    # If the request clearly needed DB data but SQL did not succeed, do NOT run the
-    # data agent on nothing (it would invent data). Report the blockage instead.
+    # If the request needed DB data but export failed / no data, don't fabricate.
     sql = state.get("sql_result")
-    if sql is not None and (sql.get("error") or not sql.get("rows")) and prelude is None:
+    if sql is not None and (sql.get("error") or not sql.get("sql")) and prelude is None:
         return {"data_result": {
-            "summary": "Could not run analysis: the required data was not fetched "
-                       "(the SQL step did not return usable data).",
+            "summary": "Could not run analysis: the required data was not fetched.",
             "n_cells": 0, "notebook": None, "had_data_handoff": False,
             "error": "no input data",
         }}
 
-    # CRITICAL: if we handed off data, TELL the agent it exists. Otherwise the agent
-    # assumes it must fetch data itself, fails (no DB access), and invents fake data.
     task = state["request"]
     if prelude is not None:
-        sql = state["sql_result"]
-        cols = list(sql["rows"][0].keys()) if sql.get("rows") else []
-        task = (f"The data is ALREADY LOADED in the kernel as a pandas DataFrame named `df`, "
-                f"loaded directly from the database (the FULL result set, columns: {cols}). "
-                f"DO NOT create, download, or invent any data — use the existing `df`. "
-                f"Start by inspecting it with df.shape and df.head().\n\n"
+        wants_model = any(w in state["request"].lower() for w in
+                          ("train", "model", "predict", "classif", "regress"))
+        extra = ""
+        if wants_model:
+            extra = (" Train and COMPARE multiple models (logistic regression, random "
+                     "forest, gradient boosting), then tune the best with "
+                     "RandomizedSearchCV, and report the final accuracy and "
+                     "classification report.")
+        task = (f"The data is ALREADY LOADED in the kernel as a pandas DataFrame `df`, "
+                f"read from a CSV ({meta['rows']} rows, columns: {meta['columns']}). "
+                f"DO NOT create, download, or invent data — use the existing `df`. "
+                f"Begin by understanding it: df.shape, df.info(), df.describe(), and the "
+                f"target distribution. Decide preprocessing from what you observe.{extra}\n\n"
                 f"Task: {state['request']}")
 
     result = run_data_agent(task, prelude=prelude)
@@ -162,15 +162,31 @@ def data_node(state: AppState) -> dict:
     phases = list(dict.fromkeys(c.phase for c in result.cells if c.phase))
     all_code = "\n".join(c.code for c in result.cells)
     trained = ".fit(" in all_code and "train_test_split" in all_code
-    return {"data_result": {
+    got_stuck = result.error is not None       # hit max cells / couldn't recover
+
+    import os
+    csv_path = os.path.abspath(os.path.join("exports", "ml_dataset.csv")) \
+        if prelude is not None else None
+
+    data_result = {
         "summary": result.summary,
         "n_cells": len(result.cells),
         "phases": phases,
         "trained_model": trained,
+        "dataset_rows": meta.get("rows") if meta else None,   # the TRUE full-dataset size
         "notebook": nb_path,
+        "csv": csv_path,                       # so YOU can open/edit the data
         "had_data_handoff": prelude is not None,
         "error": result.error,
-    }}
+    }
+    if got_stuck:
+        # PRAGMATIC COLLABORATION: agent couldn't finish. Hand control to the human
+        # with the artifacts, instead of silently failing or faking success.
+        data_result["handoff_to_user"] = (
+            f"The agent got stuck and stopped. You can take over: the data is at "
+            f"{csv_path} and the notebook-so-far is at {os.path.abspath(nb_path)}. "
+            f"Open the notebook, fix the failing step, and continue manually.")
+    return {"data_result": data_result}
 
 
 def route_decision(state: AppState) -> str:

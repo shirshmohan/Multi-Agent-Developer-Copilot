@@ -14,38 +14,47 @@ from dataclasses import dataclass, field
 from llm import get_llm
 from tools.kernel import JupyterKernel, CellOutput
 
-MAX_CELLS = 25   # circuit breaker. ML workflows need room: clean+EDA+features+train+eval,
-                 # PLUS spare cells for the agent to recover from errors it hits.
+MAX_CELLS = 35   # richer pipeline (EDA + multi-model + RandomizedSearchCV + eval) plus
+                 # headroom to recover from errors. Each cell is one LLM round-trip.
 
-SYSTEM = """You are a senior data scientist working in a live Jupyter kernel.
+SYSTEM = """You are a senior ML engineer working in a live Jupyter kernel.
 You complete the user's task by writing and running Python code ONE cell at a time.
 
 How you work:
 - Call run_code to execute a cell. You will see its output (text, tables, errors,
   and whether a chart was produced) before deciding the next cell.
-- NEVER invent, download, or randomly generate data. If a DataFrame `df` is already
-  loaded in the kernel, use it. If you are unsure what data exists, inspect it first
-  with df.head() and df.info() — do not fabricate a dataset.
-- State persists between cells (variables, imports, DataFrames stay alive). Once you
-  have loaded or created data, DO NOT re-create it — reuse the existing variables.
-- Each cell must make NEW progress. Move forward through phases; never repeat a
-  step you have already completed.
-- Work in clear phases: load/inspect data, clean it, explore (EDA with charts),
-  engineer features if useful, train a model, evaluate it.
-- When training a model, follow this ORDER strictly and verify each step's output
-  before the next:
-    1. Encode categorical/text columns to numbers (e.g. pd.get_dummies). The target
-       'churn' is boolean — convert it to int (0/1).
-    2. Define X (all feature columns) and y (the target) explicitly. Drop ID columns
-       like customer_id from X.
-    3. Print X.shape and y.shape to CONFIRM they exist before splitting.
-    4. train_test_split, then fit the model, then evaluate (accuracy + a report).
-  Never call train_test_split or model.fit before X and y are defined and confirmed.
-- Read each output and adapt. If a cell errors, READ the error and fix the actual
-  cause in the next cell — do not blindly repeat the same failing code.
-- Use matplotlib for charts (they are captured automatically). seaborn is NOT
-  guaranteed to be installed — prefer matplotlib.
-- When the task is fully done, call finish with a short summary. Do NOT keep going.
+- NEVER invent, download, or randomly generate data. A DataFrame `df` is already
+  loaded. Use it. If unsure what it contains, inspect with df.head()/df.info() first.
+- State persists between cells. Reuse variables; never re-create data you already have.
+- Each cell must make NEW progress. Read each output and adapt. If a cell errors,
+  read the error and fix the ROOT CAUSE in the next cell — never repeat failing code.
+- Use matplotlib for charts (captured automatically). seaborn may not be installed.
+
+WHEN THE TASK INVOLVES TRAINING A MODEL, follow this EXACT pipeline. Do each step as
+its own cell and CONFIRM its output before moving on. Do not skip or merge steps:
+
+  STEP 1 — Understand: df.shape, df.info(), and the target's value_counts.
+  STEP 2 — Clean & encode: convert booleans to int; one-hot encode categorical
+           columns with pd.get_dummies. DROP identifier columns (e.g. customer_id)
+           — they are not features.
+  STEP 3 — DEFINE X AND y EXPLICITLY. This step is MANDATORY and the most commonly
+           skipped — do NOT skip it:
+               y = df_encoded['churn'].astype(int)
+               X = df_encoded.drop(columns=['churn'])
+           Then PRINT X.shape and y.shape to confirm both exist.
+  STEP 4 — Split: train_test_split(X, y, test_size=0.2, random_state=42, stratify=y).
+           Print the train/test shapes.
+  STEP 5 — Train MULTIPLE models and compare. Fit at least: LogisticRegression
+           (max_iter=1000), RandomForestClassifier, and GradientBoostingClassifier.
+           Print each model's test accuracy so they can be compared.
+  STEP 6 — Tune the BEST model with RandomizedSearchCV (a small param grid, cv=3,
+           n_iter=5). Print the best params and best cross-validated score.
+  STEP 7 — Evaluate the tuned model: print accuracy and classification_report on
+           the test set. If imbalanced, note it.
+
+NEVER call train_test_split or model.fit before X and y are defined and printed.
+Only call finish AFTER a model has actually been trained and evaluated (a real
+model.fit has run without error). Do not claim success you have not achieved.
 
 Available libraries: pandas, numpy, matplotlib, scikit-learn.
 """
@@ -88,6 +97,23 @@ class Cell:
     output: CellOutput
 
 
+def _names_exist(kernel: JupyterKernel, names: list[str]) -> bool:
+    """Probe the live kernel: are ALL these variable names actually defined?
+    This is how we VERIFY state instead of trusting the model's claims.
+    Uses globals() — dir() inside print() runs in a different scope and misses them."""
+    check = "print(all(n in globals() for n in %r))" % names
+    out = kernel.run(check)
+    return "True" in out.stdout
+
+
+def _blocked_output(reason: str) -> CellOutput:
+    """A CellOutput representing a cell we refused to run (so the notebook shows why)."""
+    co = CellOutput()
+    co.ok = False
+    co.error = f"[blocked by guard] {reason}"
+    return co
+
+
 @dataclass
 class DataResult:
     summary: str = ""
@@ -107,7 +133,11 @@ def run_data_agent(task: str, kernel: JupyterKernel | None = None,
 
     try:
         if prelude:
-            k.run(prelude)                              # silent setup, not shown to the model
+            out = k.run(prelude)                        # setup (e.g. load df from CSV)
+            # RECORD it as the notebook's first cell, so the notebook is REPRODUCIBLE:
+            # a human can open it and "Run All" — df gets created by a visible cell,
+            # not by hidden setup. Without this, cell 1 references an undefined df.
+            cells.append(Cell(code=prelude, phase="setup", output=out))
 
         messages = [
             {"role": "system", "content": SYSTEM},
@@ -144,6 +174,37 @@ def run_data_agent(task: str, kernel: JupyterKernel | None = None,
             # run_code: execute the cell, record it, feed the summary back
             code = call.arguments.get("code", "")
             phase = call.arguments.get("phase", "")
+
+            # DETERMINISTIC GUARD: the model repeatedly runs steps before their inputs
+            # exist (split before X/y; fit before the split). Telling it harder in the
+            # prompt doesn't work, so VERIFY kernel state and intercept doomed cells.
+            block_msg = None
+            if "train_test_split(" in code and not _names_exist(k, ["X", "y"]):
+                block_msg = (
+                    "STOP. I checked the kernel: `X` and `y` do NOT exist yet. You cannot "
+                    "split before defining them. Your NEXT cell must be exactly:\n"
+                    "    y = df_encoded['churn'].astype(int)\n"
+                    "    X = df_encoded.drop(columns=['churn'])\n"
+                    "    print(X.shape, y.shape)\n"
+                    "(adjust the DataFrame name if yours differs). Define X and y now.")
+            elif ".fit(" in code and not _names_exist(k, ["X_train", "y_train"]):
+                block_msg = (
+                    "STOP. I checked the kernel: `X_train`/`y_train` do NOT exist yet. You "
+                    "cannot fit a model before splitting. If X and y exist, your NEXT cell "
+                    "must be:\n"
+                    "    from sklearn.model_selection import train_test_split\n"
+                    "    X_train, X_test, y_train, y_test = train_test_split("
+                    "X, y, test_size=0.2, random_state=42, stratify=y)\n"
+                    "    print(X_train.shape, X_test.shape)\n"
+                    "If X and y don't exist yet, define those first.")
+            if block_msg:
+                cells.append(Cell(code=code, phase=phase,
+                                  output=_blocked_output(block_msg.split(chr(10))[0])))
+                messages.append({"role": "assistant",
+                                 "content": "(blocked: prerequisite not defined)"})
+                messages.append({"role": "user", "content": block_msg})
+                continue
+
             out = k.run(code)
             cells.append(Cell(code=code, phase=phase, output=out))
 
